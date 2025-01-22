@@ -31,7 +31,8 @@ extern "C" {
  * by an acknowledgment packet before the next packet can be sent.
  * A data packet of less than 512 bytes signals termination of a transfer.
  */
-#define TFTP_BLOCK_SIZE          512
+// #define TFTP_BLOCK_SIZE          512
+#define TFTP_BLOCK_SIZE          1500 // typical max UDP block should fit
 
 /**
  * RFC1350: For non-request TFTP message, the header contains 2-byte operation
@@ -66,7 +67,14 @@ enum tftp_evt_type {
 	 *
 	 * @note DATA event structure contains payload data and size.
 	 */
-	TFTP_EVT_DATA,
+	TFTP_EVT_GETDATA,
+
+	/**
+	 * DATA event when data is received from remote server.
+	 *
+	 * @note DATA event structure contains payload data and size.
+	 */
+	TFTP_EVT_PUTDATA,
 
 	/**
 	 * ERROR event when error is received from remote server.
@@ -117,7 +125,7 @@ struct tftp_evt {
  * @param[in] evt Event description along with result and associated
  *                parameters (if any).
  */
-typedef void (*tftp_callback_t)(const struct tftp_evt *evt);
+typedef int (*tftp_callback_t)(const struct tftp_evt *evt);
 
 /**
  * @brief TFTP client definition to maintain information relevant to the
@@ -133,6 +141,14 @@ struct tftpc {
 	/** Event notification callback. No notification if NULL */
 	tftp_callback_t callback;
 
+	/** negotiated block size */
+	uint16_t blksize;
+
+	/* internal transfer state */
+	uint16_t tftpc_block_no;
+	uint32_t tftpc_index;
+	int sock;
+
 	/** Buffer for internal usage */
 	uint8_t tftp_buf[TFTPC_MAX_BUF_SIZE];
 };
@@ -142,7 +158,9 @@ struct tftpc {
  *
  * @param client      Client information of type @ref tftpc.
  * @param remote_file Name of the remote file to get.
+ * @param open_param  String passed to first callback call (local file name).
  * @param mode        TFTP Client "mode" setting.
+ * @param max_blksize TFTP Client "blksize" setting.
  *
  * @retval The size of data being received if the operation completed successfully.
  * @retval TFTPC_BUFFER_OVERFLOW if the file is larger than the user buffer.
@@ -153,17 +171,17 @@ struct tftpc {
  * @note This function blocks until the transfer is completed or network error happens. The
  *       integrity of the `client` structure must be ensured until the function returns.
  */
-int tftp_get(struct tftpc *client,
-	     const char *remote_file, const char *mode);
+int tftp_get(struct tftpc *client, const char *remote_file,
+  const char *open_param, const char *mode, unsigned int max_blksize);
 
 /**
  * @brief This function puts data to a "file" on the remote server.
  *
  * @param client      Client information of type @ref tftpc.
  * @param remote_file Name of the remote file to put.
+ * @param open_param  String passed to first callback call (local file name).
  * @param mode        TFTP Client "mode" setting.
- * @param user_buf    Data buffer containing the data to put.
- * @param user_buf_size Length of the data to put.
+ * @param max_blksize TFTP Client "blksize" setting.
  *
  * @retval The size of data being sent if the operation completed successfully.
  * @retval TFTPC_REMOTE_ERROR if the server failed to process our request.
@@ -173,9 +191,8 @@ int tftp_get(struct tftpc *client,
  * @note This function blocks until the transfer is completed or network error happens. The
  *       integrity of the `client` structure must be ensured until the function returns.
  */
-int tftp_put(struct tftpc *client,
-	     const char *remote_file, const char *mode,
-	     const uint8_t *user_buf, uint32_t user_buf_size);
+int tftp_put(struct tftpc *client, const char *remote_file,
+  const char *open_param, const char *mode, unsigned int max_blksize);
 
 #ifdef __cplusplus
 }

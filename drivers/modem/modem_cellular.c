@@ -517,7 +517,7 @@ MODEM_CHAT_MATCHES_DEFINE(dial_abort_matches,
 			  MODEM_CHAT_MATCH("NO CARRIER", "", NULL),
 			  MODEM_CHAT_MATCH("NO DIALTONE", "", NULL));
 
-#if DT_HAS_COMPAT_STATUS_OKAY(swir_hl7800) || DT_HAS_COMPAT_STATUS_OKAY(sqn_gm02s)
+#if DT_HAS_COMPAT_STATUS_OKAY(quectel_bg95) || DT_HAS_COMPAT_STATUS_OKAY(swir_hl7800) || DT_HAS_COMPAT_STATUS_OKAY(sqn_gm02s)
 MODEM_CHAT_MATCH_DEFINE(connect_match, "CONNECT", "", NULL);
 #endif
 
@@ -1851,7 +1851,8 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(quectel_bg95_init_chat_script_cmds,
 			      MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
 			      MODEM_CHAT_SCRIPT_CMD_RESP("AT+QCCID", qccid_match),
 			      MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
-			      MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT+CMUX=0,0,5,127", 300));
+			      MODEM_CHAT_SCRIPT_CMD_RESP("AT+CMUX=0,0,5,127", ok_match));
+
 
 MODEM_CHAT_SCRIPT_DEFINE(quectel_bg95_init_chat_script, quectel_bg95_init_chat_script_cmds,
 			 abort_matches, modem_cellular_chat_callback_handler, 10);
@@ -1862,7 +1863,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(quectel_bg95_dial_chat_script_cmds,
 							 "\""CONFIG_MODEM_CELLULAR_APN"\"",
 							 ok_match),
 			      MODEM_CHAT_SCRIPT_CMD_RESP("AT+CFUN=1", ok_match),
-			      MODEM_CHAT_SCRIPT_CMD_RESP_NONE("ATD*99***1#", 0),);
+			      MODEM_CHAT_SCRIPT_CMD_RESP("ATD*99***1#", connect_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(quectel_bg95_dial_chat_script, quectel_bg95_dial_chat_script_cmds,
 			 dial_abort_matches, modem_cellular_chat_callback_handler, 10);

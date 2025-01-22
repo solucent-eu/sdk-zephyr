@@ -69,7 +69,14 @@ static void esp_configure_hostname(struct esp_data *data)
 #if defined(CONFIG_NET_HOSTNAME_ENABLE)
 	char cmd[sizeof("AT+CWHOSTNAME=\"\"") + NET_HOSTNAME_MAX_LEN];
 
-	snprintk(cmd, sizeof(cmd), "AT+CWHOSTNAME=\"%s\"", net_hostname_get());
+	const char *s = net_hostname_get();
+	if (!s || s[0] == '\0') {
+		net_hostname_init();
+		s = net_hostname_get();
+		if (!s || s[0] == '\0')
+			s = "ESP32";
+	}
+	snprintk(cmd, sizeof(cmd), "AT+CWHOSTNAME=\"%s\"", s);
 	cmd[sizeof(cmd) - 1] = '\0';
 
 	esp_cmd_send(data, NULL, 0, cmd, ESP_CMD_TIMEOUT);
@@ -825,7 +832,7 @@ static int cmd_ipd_parse_hdr(struct esp_data *dev,
 		char *remote_ip;
 		long port;
 
-		err = esp_pull_quoted(&str, str_end, &remote_ip);
+		err = str[0] == '"' ? esp_pull_quoted(&str, str_end, &remote_ip) : esp_pull_raw(&str, str_end, &remote_ip);
 		if (err) {
 			if (err == -EAGAIN && match_len >= MAX_IPD_LEN) {
 				LOG_ERR("Failed to pull remote_ip");
@@ -852,6 +859,7 @@ static int cmd_ipd_parse_hdr(struct esp_data *dev,
 
 		recv_addr->sin_family = AF_INET;
 		recv_addr->sin_port = htons(port);
+		(*sock)->context->flags |= NET_CONTEXT_REMOTE_ADDR_SET;
 	}
 
 	*data_offset = (str - ipd_buf);

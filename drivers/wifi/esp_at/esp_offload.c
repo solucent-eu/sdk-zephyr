@@ -99,6 +99,22 @@ static int _sock_connect(struct esp_data *dev, struct esp_socket *sock)
 				 sock->link_id, dst_addr_str,
 				 ntohs(net_sin(&dst)->sin_port), ntohs(net_sin(&src)->sin_port),
 				 mode, src_addr_str);
+			if (IS_ENABLED(CONFIG_WIFI_ESP_AT_VERSION_1_7)) {
+				// "src addr" not supported in 1.7
+				snprintk(connect_msg, sizeof(connect_msg),
+					"AT+CIPSTART=%d,\"UDP\",\"%s\",%d,%d,0",
+					sock->link_id, dst_addr_str,
+					ntohs(net_sin(&dst)->sin_port), ntohs(net_sin(&src)->sin_port));
+			} else {
+				net_addr_ntop(src.sa_family,
+								&net_sin(&src)->sin_addr,
+								src_addr_str, sizeof(src_addr_str));
+				snprintk(connect_msg, sizeof(connect_msg),
+					"AT+CIPSTART=%d,\"UDP\",\"%s\",%d,%d,0,\"%s\"",
+					sock->link_id, dst_addr_str,
+					ntohs(net_sin(&dst)->sin_port), ntohs(net_sin(&src)->sin_port),
+					src_addr_str);
+			}
 		} else {
 			snprintk(connect_msg, sizeof(connect_msg),
 				 "AT+CIPSTART=%d,\"UDP\",\"%s\",%d",
@@ -163,7 +179,8 @@ static int esp_bind(struct net_context *context, const struct sockaddr *addr,
 		LOG_DBG("link %d", sock->link_id);
 
 		if (esp_socket_connected(sock)) {
-			return -EISCONN;
+			LOG_INF("Already bound");
+			// return -EISCONN;
 		}
 
 		k_mutex_lock(&sock->lock, K_FOREVER);
@@ -197,7 +214,8 @@ static int esp_connect(struct net_context *context,
 	}
 
 	if (esp_socket_connected(sock)) {
-		return -EISCONN;
+  	LOG_INF("Already connected");
+		// return -EISCONN;
 	}
 
 	k_mutex_lock(&sock->lock, K_FOREVER);
@@ -205,6 +223,9 @@ static int esp_connect(struct net_context *context,
 	sock->connect_cb = cb;
 	sock->conn_user_data = user_data;
 	k_mutex_unlock(&sock->lock);
+
+	if (esp_socket_connected(sock))
+		return 0;
 
 	if (timeout == 0) {
 		esp_socket_work_submit(sock, &sock->connect_work);
@@ -576,17 +597,16 @@ MODEM_CMD_DIRECT_DEFINE(on_cmd_ciprecvdata)
 	recv_addr->sin_port = htons(port);
 	recv_addr->sin_family = AF_INET;
 
-	/* IP addr comes within quotation marks, which is disliked by
-	 * conv function. So we remove them by subtraction 2 from
-	 * raw_remote_ip length and index from &raw_remote_ip[1].
+	/* IP addr may come within quotation marks, which is disliked by
+	 * conv function. Remove them if present.
 	 */
-	char remote_ip_addr[INET_ADDRSTRLEN];
-	size_t remote_ip_str_len;
-
-	remote_ip_str_len = MIN(sizeof(remote_ip_addr) - 1,
-				strlen(raw_remote_ip) - 2);
-	strncpy(remote_ip_addr, &raw_remote_ip[1], remote_ip_str_len);
-	remote_ip_addr[remote_ip_str_len] = '\0';
+	char *remote_ip_addr = raw_remote_ip;
+	size_t remote_ip_str_len = strlen(remote_ip_addr);
+	if (*remote_ip_addr == '\"') {
+		remote_ip_addr++;
+		remote_ip_str_len -= 2;
+		remote_ip_addr[remote_ip_str_len] = '\0';
+	}
 
 	if (net_addr_pton(AF_INET, remote_ip_addr, &recv_addr->sin_addr) < 0) {
 		LOG_ERR("Invalid src addr %s", remote_ip_addr);

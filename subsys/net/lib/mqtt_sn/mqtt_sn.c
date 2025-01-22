@@ -869,11 +869,12 @@ int mqtt_sn_client_init(struct mqtt_sn_client *client, const struct mqtt_sn_data
 
 	k_work_init_delayable(&client->process_work, process_work);
 
+	int err = 0;
 	if (transport->init) {
-		transport->init(transport);
+		err = transport->init(transport);
 	}
 
-	return 0;
+	return err;
 }
 
 void mqtt_sn_client_deinit(struct mqtt_sn_client *client)

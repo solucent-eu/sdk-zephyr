@@ -194,8 +194,8 @@ static int cmd_ls(const struct shell *sh, size_t argc, char **argv)
 			break;
 		}
 
-		shell_print(sh, "%s%s", entry.name,
-			      (entry.type == FS_DIR_ENTRY_DIR) ? "/" : "");
+		shell_print(sh, "%s%s %u", entry.name,
+			      (entry.type == FS_DIR_ENTRY_DIR) ? "/" : "", entry.size);
 	}
 
 	fs_closedir(&dir);

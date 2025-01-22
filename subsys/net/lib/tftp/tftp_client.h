@@ -30,6 +30,7 @@
 #define DATA_OPCODE              0x3
 #define ACK_OPCODE               0x4
 #define ERROR_OPCODE             0x5
+#define OACK_OPCODE              0x6
 
 /* Error Codes */
 
@@ -49,6 +50,8 @@
 #define TFTP_ERROR_FILE_EXISTS         6
 /** No such user. */
 #define TFTP_ERROR_NO_USER             7
+/** Option error */
+#define TFTP_ERROR_OPTION              8
 
 struct tftphdr_ack {
 	uint16_t opcode;

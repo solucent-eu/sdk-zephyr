@@ -15,22 +15,29 @@ LOG_MODULE_REGISTER(tftp_client, CONFIG_TFTP_LOG_LEVEL);
 	(sa.sa_family == AF_INET ? \
 		sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6))
 
+static int error_callback(struct tftpc *client, int block_no);
+
 /*
  * Prepare a request as required by RFC1350. This packet can be sent
  * out directly to the TFTP server.
  */
 static size_t make_request(uint8_t *buf, int request,
-			   const char *remote_file, const char *mode)
+			   const char *remote_file, const char *mode,
+				 uint16_t max_blksize)
 {
 	char *ptr = (char *)buf;
 	const char def_mode[] = "octet";
+
+	// a limitation that makes code simpler below
+	if (TFTP_BLOCK_SIZE < 50)
+		return 0;
 
 	/* Fill in the Request Type. */
 	sys_put_be16(request, ptr);
 	ptr += 2;
 
 	/* Copy the name of the remote file. */
-	strncpy(ptr, remote_file, TFTP_MAX_FILENAME_SIZE);
+	strncpy(ptr, remote_file, TFTP_BLOCK_SIZE-30);
 	ptr += strlen(remote_file);
 	*ptr++ = '\0';
 
@@ -44,14 +51,24 @@ static size_t make_request(uint8_t *buf, int request,
 	ptr += strlen(mode);
 	*ptr++ = '\0';
 
+	// Implement RFC2348
+	if (max_blksize != 512) {
+		strcpy(ptr, "blksize");
+		ptr += strlen(ptr);
+		*ptr++ = '\0';
+
+		sprintf(ptr, "%d", max_blksize);
+		ptr += strlen(ptr);
+		*ptr++ = '\0';
+	}
+
 	return ptr - (char *)buf;
 }
 
 /*
  * Send Data message to the TFTP Server and receive ACK message from it.
  */
-static int send_data(int sock, struct tftpc *client, uint32_t block_no, const uint8_t *data_buffer,
-		     size_t data_size)
+static int send_data(int sock, struct tftpc *client, size_t data_size)
 {
 	int ret;
 	int send_count = 0, ack_count = 0;
@@ -60,7 +77,7 @@ static int send_data(int sock, struct tftpc *client, uint32_t block_no, const ui
 		.events = ZSOCK_POLLIN,
 	};
 
-	LOG_DBG("Client send data: block no %u, size %u", block_no, data_size + TFTP_HEADER_SIZE);
+	LOG_DBG("Client send data: block no %u, size %u", client->tftpc_block_no, data_size + TFTP_HEADER_SIZE);
 
 	do {
 		if (send_count > TFTP_REQ_RETX) {
@@ -70,8 +87,7 @@ static int send_data(int sock, struct tftpc *client, uint32_t block_no, const ui
 
 		/* Prepare DATA packet, send it out then poll for ACK response */
 		sys_put_be16(DATA_OPCODE, client->tftp_buf);
-		sys_put_be16(block_no, client->tftp_buf + 2);
-		memcpy(client->tftp_buf + TFTP_HEADER_SIZE, data_buffer, data_size);
+		sys_put_be16(client->tftpc_block_no, client->tftp_buf + 2);
 
 		ret = zsock_send(sock, client->tftp_buf, data_size + TFTP_HEADER_SIZE, 0);
 		if (ret < 0) {
@@ -104,27 +120,19 @@ static int send_data(int sock, struct tftpc *client, uint32_t block_no, const ui
 			}
 
 			uint16_t opcode = sys_get_be16(client->tftp_buf);
-			uint16_t blockno = sys_get_be16(client->tftp_buf + 2);
+			uint16_t block_no = sys_get_be16(client->tftp_buf + 2);
 
 			LOG_DBG("Receive: opcode %u, block no %u, size %d",
-				opcode, blockno, ret);
+				opcode, block_no, ret);
 
-			if (opcode == ACK_OPCODE && blockno == block_no) {
+			if (opcode == ACK_OPCODE && block_no == client->tftpc_block_no) {
 				return TFTPC_SUCCESS;
-			} else if (opcode == ACK_OPCODE && blockno < block_no) {
+			} else if (opcode == ACK_OPCODE && block_no < client->tftpc_block_no) {
 				LOG_WRN("Server responded with obsolete block number.");
 				ack_count++;
 				continue; /* duplicated ACK */
 			} else if (opcode == ERROR_OPCODE) {
-				if (client->callback) {
-					struct tftp_evt evt = {
-						.type = TFTP_EVT_ERROR
-					};
-
-					evt.param.error.msg = client->tftp_buf + TFTP_HEADER_SIZE;
-					evt.param.error.code = block_no;
-					client->callback(&evt);
-				}
+				error_callback(client, block_no);
 				LOG_WRN("Server responded with obsolete block number.");
 				break;
 			} else {
@@ -180,14 +188,15 @@ static inline int send_ack(int sock, struct tftphdr_ack *ackhdr)
 }
 
 static int send_request(int sock, struct tftpc *client,
-			int request, const char *remote_file, const char *mode)
+			int request, const char *remote_file, const char *mode,
+			unsigned int max_blksize)
 {
 	int tx_count = 0;
 	size_t req_size;
 	int ret;
 
 	/* Create TFTP Request. */
-	req_size = make_request(client->tftp_buf, request, remote_file, mode);
+	req_size = make_request(client->tftp_buf, request, remote_file, mode, max_blksize);
 
 	do {
 		tx_count++;
@@ -223,8 +232,60 @@ static int send_request(int sock, struct tftpc *client,
 				     &from_addr, &from_addr_len);
 		if (ret < TFTP_HEADER_SIZE) {
 			req_size = make_request(client->tftp_buf, request,
-						remote_file, mode);
+						remote_file, mode, max_blksize);
 			continue;
+		}
+
+  	// Implement RFC2348
+		uint16_t opcode = sys_get_be16(client->tftp_buf);
+		client->blksize = 512;
+		if (opcode == OACK_OPCODE) {
+			if (ret < 2 + 8 + 2) {
+				LOG_ERR("Invalid OACK packet size %d", ret);
+				ret = -EIO;
+				break;
+			}
+			// parse MTU
+			char *ptr = (char *)client->tftp_buf + 2;
+			if (strncmp(ptr, "blksize", 7) == 0) {
+				ptr += 8;
+				client->blksize = atoi(ptr);
+				if (client->blksize < 8 || client->blksize > TFTP_BLOCK_SIZE) {
+					send_err(sock, client, TFTP_ERROR_OPTION, "invalid blksize");
+					LOG_ERR("Invalid block size %d", client->blksize);
+					ret = -EINVAL;
+					break;
+				}
+			}
+			if (request == READ_REQUEST) {
+				// we need to respond with ACK
+				struct tftphdr_ack ackhdr = {
+					.opcode = htons(ACK_OPCODE),
+					.block = htons(0)
+				};
+				ret = zsock_sendto(sock, &ackhdr, sizeof(ackhdr), 0, &from_addr,
+						from_addr_len);
+				if (ret < 0)
+					break;
+
+				ret = zsock_poll(&fds, 1, CONFIG_TFTPC_REQUEST_TIMEOUT);
+				if (ret <= 0) {
+					ret = -EIO;
+					break;
+				}
+
+				ret = zsock_recvfrom(sock, client->tftp_buf, TFTPC_MAX_BUF_SIZE, 0,
+								&from_addr, &from_addr_len);
+				if (ret < TFTP_HEADER_SIZE) {
+					ret = -EIO;
+					break;
+				}
+			} else if (request == WRITE_REQUEST) {
+				// remove OACK, simulate normal ACK
+				sys_put_be16(ACK_OPCODE, client->tftp_buf);
+				sys_put_be16(0, client->tftp_buf + 2);
+				ret = 4;
+			}
 		}
 
 		/* Limit communication to the specific address:port */
@@ -241,11 +302,60 @@ static int send_request(int sock, struct tftpc *client,
 	return ret;
 }
 
-int tftp_get(struct tftpc *client, const char *remote_file, const char *mode)
+static int file_callback(struct tftpc *client, enum tftp_evt_type et, const char *open_param)
+{
+	if (client->callback) {
+		struct tftp_evt evt = {
+			.type = et
+		};
+
+		if (open_param)
+			strncpy(client->tftp_buf, open_param, sizeof(client->tftp_buf));
+		else
+			client->tftp_buf[0] = '\0';
+		evt.param.data.data_ptr = NULL;
+		evt.param.data.len      = 0;
+		return client->callback(&evt);
+	}
+
+	return 0;
+}
+
+static int data_callback(struct tftpc *client, enum tftp_evt_type et, char *data, uint16_t data_size)
+{
+	if (client->callback) {
+		struct tftp_evt evt = {
+			.type = et
+		};
+
+		evt.param.data.data_ptr = data;
+		evt.param.data.len      = data_size;
+		return client->callback(&evt);
+	}
+
+	return 0;
+}
+
+static int error_callback(struct tftpc *client, int block_no)
+{
+	if (client->callback) {
+		struct tftp_evt evt = {
+			.type = TFTP_EVT_ERROR
+		};
+
+		evt.param.error.msg = client->tftp_buf + TFTP_HEADER_SIZE;
+		evt.param.error.code = block_no;
+		client->callback(&evt);
+	}
+
+	return 0;
+}
+
+int tftp_get(struct tftpc *client, const char *remote_file,
+				const char *open_param, const char *mode,
+				unsigned int max_blksize)
 {
 	int sock;
-	uint32_t tftpc_block_no = 1;
-	uint32_t tftpc_index = 0;
 	int tx_count = 0;
 	struct tftphdr_ack ackhdr = {
 		.opcode = htons(ACK_OPCODE),
@@ -254,7 +364,7 @@ int tftp_get(struct tftpc *client, const char *remote_file, const char *mode)
 	int rcv_size;
 	int ret;
 
-	if (client == NULL) {
+	if (client == NULL || remote_file == NULL || (open_param && !open_param[0])) {
 		return -EINVAL;
 	}
 
@@ -264,11 +374,21 @@ int tftp_get(struct tftpc *client, const char *remote_file, const char *mode)
 		return -errno;
 	}
 
+	client->tftpc_block_no = 1;
+	client->tftpc_index = 0;
+	if (open_param) {
+		ret = file_callback(client, TFTP_EVT_GETDATA, open_param);
+		if (ret < 0) {
+			zsock_close(sock);
+			return ret;
+		}
+	}
+
 	/* Send out the READ request to the TFTP Server. */
-	ret = send_request(sock, client, READ_REQUEST, remote_file, mode);
+	ret = send_request(sock, client, READ_REQUEST, remote_file, mode, max_blksize);
 	rcv_size = ret;
 
-	while (rcv_size >= TFTP_HEADER_SIZE && rcv_size <= TFTPC_MAX_BUF_SIZE) {
+	while (rcv_size >= TFTP_HEADER_SIZE && rcv_size <= TFTPC_MAX_BUF_SIZE) { //? TFTP_HEADER_SIZE+client->blksize
 		/* Process server response. */
 		uint16_t opcode = sys_get_be16(client->tftp_buf);
 		uint16_t block_no = sys_get_be16(client->tftp_buf + 2);
@@ -277,15 +397,7 @@ int tftp_get(struct tftpc *client, const char *remote_file, const char *mode)
 			opcode, block_no, rcv_size);
 
 		if (opcode == ERROR_OPCODE) {
-			if (client->callback) {
-				struct tftp_evt evt = {
-					.type = TFTP_EVT_ERROR
-				};
-
-				evt.param.error.msg = client->tftp_buf + TFTP_HEADER_SIZE;
-				evt.param.error.code = block_no;
-				client->callback(&evt);
-			}
+			error_callback(client, block_no);
 			ret = TFTPC_REMOTE_ERROR;
 			break;
 		} else if (opcode != DATA_OPCODE) {
@@ -294,15 +406,17 @@ int tftp_get(struct tftpc *client, const char *remote_file, const char *mode)
 			break;
 		}
 
-		if (block_no == tftpc_block_no) {
+		if (block_no == client->tftpc_block_no) {
 			uint32_t data_size = rcv_size - TFTP_HEADER_SIZE;
 
-			tftpc_block_no++;
+			client->tftpc_block_no++;
 			ackhdr.block = htons(block_no);
 			tx_count = 0;
 
-			if (client->callback == NULL) {
-				LOG_ERR("No callback defined.");
+			/* Send received data to client */
+			ret = data_callback(client, TFTP_EVT_GETDATA, client->tftp_buf + TFTP_HEADER_SIZE, data_size);
+			if (ret < 0) {
+				LOG_ERR("Failed to process received data.");
 				if (send_err(sock, client, TFTP_ERROR_DISK_FULL, NULL) < 0) {
 					LOG_ERR("Failed to send error response, err: %d",
 						-errno);
@@ -311,25 +425,16 @@ int tftp_get(struct tftpc *client, const char *remote_file, const char *mode)
 				goto get_end;
 			}
 
-			/* Send received data to client */
-			struct tftp_evt evt = {
-				.type = TFTP_EVT_DATA
-			};
-
-			evt.param.data.data_ptr = client->tftp_buf + TFTP_HEADER_SIZE;
-			evt.param.data.len      = data_size;
-			client->callback(&evt);
-
 			/* Update the index. */
-			tftpc_index += data_size;
+			client->tftpc_index += data_size;
 
 			/* Per RFC1350, the end of a transfer is marked
-			 * by datagram size < TFTPC_MAX_BUF_SIZE.
+			 * by datagram size < client->blksize.
 			 */
-			if (rcv_size < TFTPC_MAX_BUF_SIZE) {
+			if (rcv_size < client->blksize) {
 				(void)send_ack(sock, &ackhdr);
-				ret = tftpc_index;
-				LOG_DBG("%d bytes received.", tftpc_index);
+				ret = client->tftpc_index;
+				LOG_DBG("%d bytes received.", ret);
 				/* RFC1350: The host acknowledging the final DATA packet may
 				 * terminate its side of the connection on sending the final ACK.
 				 */
@@ -360,26 +465,23 @@ int tftp_get(struct tftpc *client, const char *remote_file, const char *mode)
 		rcv_size = ret;
 	}
 
-	if (!(rcv_size >= TFTP_HEADER_SIZE && rcv_size <= TFTPC_MAX_BUF_SIZE)) {
+	if (!(rcv_size >= TFTP_HEADER_SIZE && rcv_size <= TFTPC_MAX_BUF_SIZE)) { //? TFTP_HEADER_SIZE+client->blksize
 		ret = TFTPC_REMOTE_ERROR;
 	}
 
 get_end:
 	zsock_close(sock);
+	file_callback(client, TFTP_EVT_GETDATA, NULL);
 	return ret;
 }
 
-int tftp_put(struct tftpc *client, const char *remote_file, const char *mode,
-	     const uint8_t *user_buf, uint32_t user_buf_size)
+int tftp_put(struct tftpc *client, const char *remote_file,
+			const char *open_param, const char *mode, unsigned int max_blksize)
 {
 	int sock;
-	uint32_t tftpc_block_no = 1;
-	uint32_t tftpc_index = 0;
-	uint32_t send_size;
-	uint8_t *send_buffer;
 	int ret;
 
-	if (client == NULL || user_buf == NULL || user_buf_size == 0) {
+	if (client == NULL || remote_file == NULL || (open_param && !open_param[0])) {
 		return -EINVAL;
 	}
 
@@ -389,8 +491,18 @@ int tftp_put(struct tftpc *client, const char *remote_file, const char *mode,
 		return -errno;
 	}
 
+	client->tftpc_block_no = 1;
+	client->tftpc_index = 0;
+	if (open_param) {
+		ret = file_callback(client, TFTP_EVT_PUTDATA, open_param);
+		if (ret < 0) {
+			zsock_close(sock);
+			return ret;
+		}
+	}
+
 	/* Send out the WRITE request to the TFTP Server. */
-	ret = send_request(sock, client, WRITE_REQUEST, remote_file, mode);
+	ret = send_request(sock, client, WRITE_REQUEST, remote_file, mode, max_blksize);
 
 	/* Check connection initiation result */
 	if (ret >= TFTP_HEADER_SIZE) {
@@ -400,15 +512,7 @@ int tftp_put(struct tftpc *client, const char *remote_file, const char *mode,
 		LOG_DBG("Receive: opcode %u, block no %u, size %d", opcode, block_no, ret);
 
 		if (opcode == ERROR_OPCODE) {
-			if (client->callback) {
-				struct tftp_evt evt = {
-					.type = TFTP_EVT_ERROR
-				};
-
-				evt.param.error.msg = client->tftp_buf + TFTP_HEADER_SIZE;
-				evt.param.error.code = block_no;
-				client->callback(&evt);
-			}
+			error_callback(client, block_no);
 			LOG_ERR("Server responded with service reject.");
 			ret = TFTPC_REMOTE_ERROR;
 			goto put_end;
@@ -424,31 +528,39 @@ int tftp_put(struct tftpc *client, const char *remote_file, const char *mode,
 
 	/* Send out data by chunks */
 	do {
-		send_size = user_buf_size - tftpc_index;
-		if (send_size > TFTP_BLOCK_SIZE) {
-			send_size = TFTP_BLOCK_SIZE;
+		ret = data_callback(client, TFTP_EVT_PUTDATA, client->tftp_buf + TFTP_HEADER_SIZE, client->blksize);
+		if (ret < 0) {
+			LOG_ERR("Failed to process sent data.");
+			if (send_err(sock, client, TFTP_ERROR_ILLEGAL_OP, NULL) < 0) {
+				LOG_ERR("Failed to send error response, err: %d",
+					-errno);
+			}
+			ret = TFTPC_BUFFER_OVERFLOW;
+			goto put_end;
 		}
-		send_buffer = (uint8_t *)(user_buf + tftpc_index);
+		int send_size = ret;
 
-		ret = send_data(sock, client, tftpc_block_no, send_buffer, send_size);
+		/* Send. */
+		ret = send_data(sock, client, send_size);
 		if (ret != TFTPC_SUCCESS) {
 			goto put_end;
 		} else {
-			tftpc_index += send_size;
-			tftpc_block_no++;
+			client->tftpc_index += send_size;
+			client->tftpc_block_no++;
 		}
 
 		/* Per RFC1350, the end of a transfer is marked
-		 * by datagram size < TFTPC_MAX_BUF_SIZE.
+		 * by datagram size < client->blksize.
 		 */
-		if (send_size < TFTP_BLOCK_SIZE) {
-			LOG_DBG("%d bytes sent.", tftpc_index);
-			ret = tftpc_index;
+		if (send_size < client->blksize) {
+			ret = client->tftpc_index;
+			LOG_DBG("%d bytes sent.", ret);
 			break;
 		}
 	} while (true);
 
 put_end:
 	zsock_close(sock);
+	file_callback(client, TFTP_EVT_PUTDATA, NULL);
 	return ret;
 }
